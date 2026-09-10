@@ -1,0 +1,795 @@
+{
+  "name": "Aura_Social_Campaign_Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Aura_Social_Campaign_Automation — Backend API (GCP)\n\n### Endpoint\n`POST https://<cloud-run-url>/webhook/aura-generate`\n(n8n di Cloud Run — tidak perlu ngrok. URL dari `N8N_HOST` / domain Cloud Run.)\n\n### Request body\n```json\n{\n  \"callbackUrl\": \"https://backend/api/aura/callback  (WAJIB)\",\n  \"contentType\": \"image | carousel | video\",\n  \"prompt\": \"prompt final\",\n  \"prompts\": [\"slide 1\", ...],        // carousel opsional\n  \"carouselCount\": 4,                  // carousel opsional\n  \"aspectRatio\": \"image: 1:1|9:16|16:9|3:4|4:3|4:5  ·  video: 9:16|16:9\",\n  \"videoDuration\": 8|16|32|48,         // video, default 8\n  \"jobId\": \"...\", \"campaign\": \"...\", \"idea\": \"...\", \"caption\": \"...\"\n}\n```\n\n### Response sync\n`{ \"jobId\": \"...\", \"status\": \"accepted\", \"contentType\": \"...\" }`\n\n### Callback (async) ke callbackUrl\n```json\n{\n  \"jobId\": \"...\", \"status\": \"success|failed\", \"contentType\": \"...\",\n  \"aspectRatio\": \"...\", \"videoDuration\": 16,\n  \"content\": {\n    \"kind\": \"image|video\", \"url\": \"https://storage.googleapis.com/<bucket>/<obj>\",\n    \"gsUri\": \"gs://<bucket>/<obj>\", \"mimeType\": \"...\", \"bytes\": 123\n    // carousel: \"kind\":\"carousel\",\"count\":3,\"slides\":[{url,gsUri,mimeType,bytes}, ...]\n  },\n  \"tokens\": { \"input\": 129, \"output\": 1073, \"total\": 1202, \"estimated\": false, \"byStep\": [...] },\n  \"restoreTokens\": false, \"restoreAmount\": 0,\n  \"error\": null, \"generatedAt\": \"...\"\n}\n```\n\n### Yang HARUS di-set (node Config — klik & edit)\n- `gcsBucket`  : nama GCS bucket\n- `gcsPrefix`  : prefix path object (mis. `generated`)\n- `filesDir`   : `/tmp/aura` (Cloud Run ephemeral)\n\n### Kredensial\n- Google Gemini (PaLM) API di 4 node Gemini (API key AI Studio)\n- **Google Service Account** di node `GCS - Upload` (role `Storage Object Creator` di bucket)\n\n### Cloud Run — setting wajib\n- `--min-instances=1` + `--no-cpu-throttling` (CPU always allocated) — workflow lanjut kerja SETELAH balas HTTP\n- `--timeout=3600` `--memory=2Gi` `--concurrency=4`\n- Env: `N8N_RESTRICT_FILE_ACCESS_TO=/tmp/aura`, `NODES_EXCLUDE=[\"n8n-nodes-base.localFileTrigger\"]`\n- **ffmpeg** harus ada di image container (Dockerfile: `apt-get install -y ffmpeg`)\n- `N8N_HOST` / `WEBHOOK_URL` = URL publik Cloud Run\n\n### Batasan prototype\n- Kontinuitas antar-scene video belum sempurna (tiap klip di-generate independen)\n- Token image/carousel = estimasi (~1290 out/gambar) — node Gemini image tak lapor usage\n- Video 48 dtk = 6 klip Veo, ~10–15 menit",
+        "height": 760,
+        "width": 780
+      },
+      "id": "sticky",
+      "name": "ENDPOINT & DEPLOY (GCP)",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -624,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aura-generate",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook - Aura Generate",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -48,
+        224
+      ],
+      "webhookId": "44fa2aad-31b6-4759-a82a-e832f4f60a13"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "gcsBucket",
+              "value": "aura-content-media",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "gcsPrefix",
+              "value": "generated",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "filesDir",
+              "value": "/tmp/aura",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        192,
+        224
+      ],
+      "notes": "EDIT DI SINI: nama bucket GCS, prefix object, folder file sementara."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const cfg = $('Config').item.json;\nconst b = $json.body || $json || {};\nconst jobId = String(b.jobId || b.job_id || $execution.id);\nconst callbackUrl = String(b.callbackUrl || b.callback_url || '').trim();\nlet contentType = String(b.contentType || b.content_type || 'image').toLowerCase();\nif (!['image', 'carousel', 'video'].includes(contentType)) contentType = 'image';\n\nconst IMG_RATIOS = ['1:1', '9:16', '16:9', '3:4', '4:3', '4:5'];\nconst VID_RATIOS = ['9:16', '16:9'];\nlet aspectRatio = String(b.aspectRatio || b.aspect_ratio || '').trim();\nif (contentType === 'video') { if (!VID_RATIOS.includes(aspectRatio)) aspectRatio = '9:16'; }\nelse { if (!IMG_RATIOS.includes(aspectRatio)) aspectRatio = '1:1'; }\nconst ratioDesc = { '1:1': 'square 1:1 composition', '9:16': 'vertical portrait 9:16', '16:9': 'horizontal widescreen 16:9', '3:4': 'portrait 3:4', '4:3': 'landscape 4:3', '4:5': 'portrait 4:5' }[aspectRatio] || aspectRatio;\n\nlet videoDuration = parseInt(b.videoDuration || b.video_duration || 8, 10);\nif (![8, 16, 32, 48].includes(videoDuration)) videoDuration = 8;\nconst segments = videoDuration / 8;\n\nconst prompt = String(b.prompt || b.image_prompt || b.video_prompt || b.idea || '').trim();\nconst prompts = Array.isArray(b.prompts) ? b.prompts.map(String) : [];\nlet carouselCount = parseInt(b.carouselCount || b.carousel_count || (prompts.length || 4), 10);\ncarouselCount = Math.max(2, Math.min(10, carouselCount));\n\nreturn { json: {\n  jobId, callbackUrl, contentType,\n  campaign: b.campaign || '', idea: b.idea || '', caption: b.caption || '',\n  aspectRatio, ratioDesc, videoDuration, segments,\n  prompt, prompts, carouselCount,\n  gcsBucket: cfg.gcsBucket, gcsPrefix: cfg.gcsPrefix, filesDir: cfg.filesDir,\n  receivedAt: new Date().toISOString()\n} };\n"
+      },
+      "id": "normalize",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ jobId: $json.jobId, status: 'accepted', contentType: $json.contentType, message: 'Job diterima. Hasil dikirim ke callbackUrl.' }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond - Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        624,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.contentType }}",
+                    "rightValue": "image",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "image"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.contentType }}",
+                    "rightValue": "carousel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "carousel"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.contentType }}",
+                    "rightValue": "video",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "video"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "switch",
+      "name": "Content Type?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        848,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-2.5-flash-image"
+        },
+        "prompt": "={{ $json.prompt }}\n\nKomposisi: {{ $json.ratioDesc }}. Visual campaign sosial media, kualitas tinggi, tanpa watermark.",
+        "options": {
+          "binaryPropertyOutput": "content"
+        }
+      },
+      "id": "gen_image",
+      "name": "Gemini - Image",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        32
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "ON2asaL6m3ZvQrnN",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const norm = $('Normalize Input').item.json;\nconst g = $input.item.json || {};\nconst bin = $input.item.binary || {};\nconst um = g.usageMetadata || {};\nlet inTok = Number(um.promptTokenCount || 0);\nlet outTok = Number(um.candidatesTokenCount || 0);\nlet estimated = false;\nif (!inTok && !outTok) { inTok = Math.ceil(String(norm.prompt || '').length / 4); outTok = 1290; estimated = true; }\nconst img = bin.content;\nconst ext = (img && img.fileExtension) || 'png';\nreturn { json: {\n  contentKind: 'image', ok: !!img,\n  gcsObject: norm.gcsPrefix + '/' + norm.jobId + '/image.' + ext,\n  mimeType: (img && img.mimeType) || 'image/png',\n  tokenSteps: [{ step: 'image', input: inTok, output: outTok, estimated }],\n  errorMsg: img ? null : String(g.error || 'image generation failed')\n}, binary: img ? { content: img } : {} };\n"
+      },
+      "id": "collect_image",
+      "name": "Collect Image",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst N = norm.carouselCount;\nconst out = [];\nfor (let i = 0; i < N; i++) {\n  const p = norm.prompts[i] || (norm.prompt + ' — variasi slide ' + (i + 1) + ' dari ' + N + ', konsisten gaya, warna, dan subjek antar slide');\n  out.push({ json: { ...norm, slideIndex: i + 1, slideTotal: N, slidePrompt: String(p) } });\n}\nreturn out;\n"
+      },
+      "id": "expand_carousel",
+      "name": "Expand Carousel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-2.5-flash-image"
+        },
+        "prompt": "{{ $json.slidePrompt }}\n\nKomposisi: {{ $json.ratioDesc }}. Slide {{ $json.slideIndex }}/{{ $json.slideTotal }} dari 1 carousel — gaya visual konsisten antar slide. Tanpa watermark.",
+        "options": {
+          "binaryPropertyOutput": "slide"
+        }
+      },
+      "id": "gen_carousel",
+      "name": "Gemini - Carousel Image",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1360,
+        224
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "ON2asaL6m3ZvQrnN",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst items = $input.all();\nconst out = [];\nlet n = 0;\nitems.forEach((it, idx) => {\n  const b = it.binary || {};\n  const g = it.json || {};\n  if (!b.slide) return;\n  n++;\n  const um = g.usageMetadata || {};\n  let inTok = Number(um.promptTokenCount || 0);\n  let outTok = Number(um.candidatesTokenCount || 0);\n  let estimated = false;\n  if (!inTok && !outTok) { inTok = Math.ceil(String(norm.prompt || '').length / 4); outTok = 1290; estimated = true; }\n  const ext = b.slide.fileExtension || 'png';\n  out.push({ json: {\n    contentKind: 'carousel', ok: true, slideIndex: n,\n    gcsObject: norm.gcsPrefix + '/' + norm.jobId + '/slide_' + String(n).padStart(2, '0') + '.' + ext,\n    mimeType: b.slide.mimeType || 'image/png',\n    tokenSteps: [{ step: 'carousel_' + n, input: inTok, output: outTok, estimated }]\n  }, binary: { content: b.slide } });\n});\nif (out.length === 0) return [{ json: { contentKind: 'carousel', ok: false, tokenSteps: [], errorMsg: 'carousel generation failed' }, binary: {} }];\nreturn out;\n"
+      },
+      "id": "collect_carousel",
+      "name": "Collect Carousel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-3.6-flash"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Pecah prompt video ini menjadi TEPAT {{ $json.segments }} scene berurutan yang menyambung jadi 1 cerita utuh, tiap scene ~8 detik.\n\nPROMPT: {{ $json.prompt }}\nRASIO: {{ $json.aspectRatio }}\n\nBalas HANYA JSON valid tanpa markdown:\n{ \"scenes\": [\"prompt gerak scene 1: shot, gerakan kamera, aksi, pencahayaan, mood, komposisi {{ $json.aspectRatio }}\", \"... scene 2 ...\"] }"
+            }
+          ]
+        },
+        "simplify": false,
+        "jsonOutput": true,
+        "builtInTools": {},
+        "options": {
+          "systemMessage": "Kamu sutradara video pendek. Output JSON valid. Scene nyambung mulus.",
+          "temperature": 0.8
+        }
+      },
+      "id": "plan_video",
+      "name": "Gemini - Plan Video Scenes",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        464
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "ON2asaL6m3ZvQrnN",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst raw = $input.first().json || {};\nlet txt = raw;\nif (txt && typeof txt === 'object') {\n  if (txt.content && typeof txt.content === 'object' && Array.isArray(txt.content.parts)) txt = txt.content.parts.map(p => (p && p.text) || '').join('');\n  else if (typeof txt.content === 'string') txt = txt.content;\n  else if (Array.isArray(txt.parts)) txt = txt.parts.map(p => (p && p.text) || '').join('');\n  else if (typeof txt.text === 'string') txt = txt.text;\n  else if (Array.isArray(txt.candidates)) { const c = txt.candidates[0]; txt = (c && c.content && c.content.parts && c.content.parts.map(p => (p && p.text) || '').join('')) || JSON.stringify(txt); }\n}\nlet plan = {};\nif (typeof txt === 'string') { try { plan = JSON.parse(txt.replace(/```json/gi, '').replace(/```/g, '').trim()); } catch (e) { plan = {}; } }\nelse if (txt && typeof txt === 'object') plan = txt;\nconst N = norm.segments;\nlet scenes = Array.isArray(plan.scenes) ? plan.scenes.map(String) : [];\nwhile (scenes.length < N) scenes.push(norm.prompt);\nscenes = scenes.slice(0, N);\nconst um = raw.usageMetadata || {};\nconst pIn = Number(um.promptTokenCount || 0);\nconst pOut = Number((um.candidatesTokenCount || 0) + (um.thoughtsTokenCount || 0)) || Number((um.totalTokenCount || 0) - pIn) || 0;\nreturn scenes.map((sc, i) => ({ json: {\n  ...norm, sceneIndex: i + 1, sceneTotal: N, scenePrompt: sc,\n  planInput: i === 0 ? pIn : 0, planOutput: i === 0 ? pOut : 0\n} }));\n"
+      },
+      "id": "parse_scenes",
+      "name": "Parse Scenes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "video",
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/veo-3.1-fast-generate-preview"
+        },
+        "prompt": "=Scene {{ $json.sceneIndex }}/{{ $json.sceneTotal }}: {{ $json.scenePrompt }}\n\nKlip ~8 detik, aspect ratio {{ $json.aspectRatio }}, awal & akhir netral supaya mulus disambung.",
+        "options": {
+          "aspectRatio": "={{ $json.aspectRatio }}",
+          "binaryPropertyOutput": "scene"
+        }
+      },
+      "id": "veo",
+      "name": "Gemini - Video Scene (Veo)",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1600,
+        464
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "ON2asaL6m3ZvQrnN",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $('Normalize Input').first().json.filesDir + '/gen_' + $('Normalize Input').first().json.jobId + '_' + String($itemIndex + 1).padStart(3, '0') + '.mp4' }}",
+        "dataPropertyName": "scene",
+        "options": {}
+      },
+      "id": "save_scene",
+      "name": "Save Scene to Disk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1840,
+        464
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst rid = norm.jobId;\nconst n = $('Parse Scenes').all().length;\nconst DIR = norm.filesDir;\nconst files = [];\nfor (let i = 1; i <= n; i++) files.push('gen_' + rid + '_' + String(i).padStart(3, '0') + '.mp4');\nconst finalPath = DIR + '/gen_' + rid + '_final.mp4';\nconst listPath = 'gen_' + rid + '_list.txt';\nconst cmd = 'mkdir -p ' + DIR + ' && cd ' + DIR + ' && FF=\"$(command -v ffmpeg || echo ffmpeg)\" && printf \"file \\'%s\\'\\\\n\" ' + files.join(' ') + ' > ' + listPath + ' && \"$FF\" -y -f concat -safe 0 -i ' + listPath + ' -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart ' + finalPath + ' 2>&1 | tail -4; echo EXIT=$?';\nreturn [{ json: { ...norm, sceneCount: n, finalPath, concatCmd: cmd } }];\n"
+      },
+      "id": "buildcmd",
+      "name": "Build ffmpeg Cmd",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.concatCmd }}"
+      },
+      "id": "concat",
+      "name": "Concat (ffmpeg)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        2320,
+        464
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "fileSelector": "={{ $('Build ffmpeg Cmd').item.json.finalPath }}",
+        "options": {
+          "fileName": "video.mp4",
+          "mimeType": "video/mp4",
+          "dataPropertyName": "content"
+        }
+      },
+      "id": "read_video",
+      "name": "Read Final Video",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        2560,
+        464
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const norm = $('Normalize Input').first().json;\nlet vid = null;\ntry { vid = ($('Read Final Video').first().binary || {}).content || null; } catch (e) { vid = null; }\nconst steps = [];\ntry {\n  const p = $('Parse Scenes').all();\n  const p0 = (p[0] && p[0].json) || {};\n  if (p0.planInput || p0.planOutput) steps.push({ step: 'plan', input: p0.planInput || 0, output: p0.planOutput || 0 });\n} catch (e) {}\nsteps.push({ step: 'veo', input: 0, output: 0, videoSeconds: norm.videoDuration, note: 'Veo dihitung per-detik' });\nreturn { json: {\n  contentKind: 'video', ok: !!vid,\n  gcsObject: norm.gcsPrefix + '/' + norm.jobId + '/video.mp4',\n  mimeType: 'video/mp4',\n  tokenSteps: steps,\n  errorMsg: vid ? null : 'video generation/concat failed'\n}, binary: vid ? { content: vid } : {} };\n"
+      },
+      "id": "collect_video",
+      "name": "Collect Video",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2800,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "create",
+        "projectRLC": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "bucketName": "={{ $('Normalize Input').first().json.gcsBucket }}",
+        "createAcl": {},
+        "createBody": {},
+        "requestOptions": {}
+      },
+      "id": "gcs_upload",
+      "name": "GCS - Upload",
+      "type": "n8n-nodes-base.googleCloudStorage",
+      "typeVersion": 1.1,
+      "position": [
+        3120,
+        240
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Perlu kredensial Google Service Account (role Storage Object Creator di bucket). Upload tiap item (image=1, carousel=N, video=1)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const norm = $('Normalize Input').first().json;\nconst ct = norm.contentType;\nconst base = 'https://storage.googleapis.com/' + norm.gcsBucket + '/';\nconst gcs = $input.all();\n\nfunction urlOf(g) { const name = g && (g.name || (g.json && g.json.name)); return name ? (base + name) : null; }\nfunction gsOf(g) { const j = g.json || g; return (j && j.bucket && j.name) ? ('gs://' + j.bucket + '/' + j.name) : null; }\n\nlet collectData = [];\ntry {\n  if (ct === 'image') collectData = $('Collect Image').all();\n  else if (ct === 'carousel') collectData = $('Collect Carousel').all();\n  else collectData = $('Collect Video').all();\n} catch (e) {}\nlet steps = [];\ncollectData.forEach(it => { if (it.json && Array.isArray(it.json.tokenSteps)) steps = steps.concat(it.json.tokenSteps); });\n\nlet content = null;\nif (ct === 'carousel') {\n  const slides = gcs.map(g => { const j = g.json || g; const u = urlOf(j); return u ? { url: u, gsUri: gsOf(j), mimeType: j.contentType || 'image/png', bytes: Number(j.size) || null } : null; }).filter(Boolean);\n  if (slides.length) content = { kind: 'carousel', count: slides.length, slides };\n} else {\n  const j = (gcs[0] && (gcs[0].json || gcs[0])) || {};\n  const u = urlOf(j);\n  if (u) content = { kind: ct, url: u, gsUri: gsOf(j), mimeType: j.contentType || (ct === 'video' ? 'video/mp4' : 'image/png'), bytes: Number(j.size) || null };\n}\n\nconst inTok = steps.reduce((a, s) => a + Number(s.input || 0), 0);\nconst outTok = steps.reduce((a, s) => a + Number(s.output || 0), 0);\nconst total = inTok + outTok;\nconst estimated = steps.some(s => s.estimated);\nconst ok = !!content;\nconst errFromCollect = (collectData.find(it => it.json && it.json.errorMsg) || { json: {} }).json.errorMsg;\n\nconst payload = {\n  jobId: norm.jobId, status: ok ? 'success' : 'failed', contentType: ct,\n  campaign: norm.campaign, idea: norm.idea, caption: norm.caption, aspectRatio: norm.aspectRatio,\n  videoDuration: ct === 'video' ? norm.videoDuration : null,\n  content,\n  tokens: { input: inTok, output: outTok, total, estimated, byStep: steps },\n  restoreTokens: !ok, restoreAmount: ok ? 0 : total,\n  error: ok ? null : (errFromCollect || 'generation or GCS upload failed'),\n  generatedAt: new Date().toISOString()\n};\nreturn [{ json: { callbackUrl: norm.callbackUrl, payload } }];\n"
+      },
+      "id": "build_payload",
+      "name": "Aggregate & Build Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "http_callback",
+      "name": "HTTP - Callback ke Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        3600,
+        240
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "command": "={{ 'rm -f ' + $('Normalize Input').first().json.filesDir + '/gen_' + $('Normalize Input').first().json.jobId + '_*' }}"
+      },
+      "id": "cleanup",
+      "name": "Cleanup",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        3840,
+        240
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook - Aura Generate": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Respond - Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond - Accepted": {
+      "main": [
+        [
+          {
+            "node": "Content Type?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Content Type?": {
+      "main": [
+        [
+          {
+            "node": "Gemini - Image",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Expand Carousel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini - Plan Video Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini - Image": {
+      "main": [
+        [
+          {
+            "node": "Collect Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Image": {
+      "main": [
+        [
+          {
+            "node": "GCS - Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand Carousel": {
+      "main": [
+        [
+          {
+            "node": "Gemini - Carousel Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini - Carousel Image": {
+      "main": [
+        [
+          {
+            "node": "Collect Carousel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Carousel": {
+      "main": [
+        [
+          {
+            "node": "GCS - Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini - Plan Video Scenes": {
+      "main": [
+        [
+          {
+            "node": "Parse Scenes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Scenes": {
+      "main": [
+        [
+          {
+            "node": "Gemini - Video Scene (Veo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini - Video Scene (Veo)": {
+      "main": [
+        [
+          {
+            "node": "Save Scene to Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Scene to Disk": {
+      "main": [
+        [
+          {
+            "node": "Build ffmpeg Cmd",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build ffmpeg Cmd": {
+      "main": [
+        [
+          {
+            "node": "Concat (ffmpeg)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Concat (ffmpeg)": {
+      "main": [
+        [
+          {
+            "node": "Read Final Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Final Video": {
+      "main": [
+        [
+          {
+            "node": "Collect Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Video": {
+      "main": [
+        [
+          {
+            "node": "GCS - Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCS - Upload": {
+      "main": [
+        [
+          {
+            "node": "Aggregate & Build Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate & Build Payload": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Callback ke Backend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP - Callback ke Backend": {
+      "main": [
+        [
+          {
+            "node": "Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "executionTimeout": 3600
+  },
+  "versionId": "9f1703b5-d42f-49e8-abf8-490f04a8955a",
+  "meta": {
+    "instanceId": "dff168c906d999d9303e8efd99a9f4a91e3d481e9bc6e898a8d85279f9fd91c0"
+  },
+  "nodeGroups": [],
+  "id": "XgzIotlw1Hn8lwAr",
+  "tags": []
+}

@@ -1,0 +1,455 @@
+{
+  "name": "Aura_Social_Campaign_Automation",
+  "meta": {
+    "description": "Menerima brief campaign (prompt saja atau prompt + gambar) dari website/Backend tim atau dari n8n Form Trigger untuk testing lokal. Memformat postingan sosial media memakai Google Gemini, default rasio 9:16 (bisa dipilih 9:16 / 16:9), generate visual sesuai rasio, lalu mengirim hasil ke Backend. Untuk fase Testing/Prototype hasil (caption + visual) juga dikirim ke Telegram chat."
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "nodes": [
+    {
+      "id": "sticky_overview",
+      "name": "SETUP - Baca dulu",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-360, -180],
+      "parameters": {
+        "width": 520,
+        "height": 520,
+        "content": "## Aura_Social_Campaign_Automation\n\n### 2 cara trigger\n1. **Website / Backend (produksi)** -> node `Webhook - Website Campaign Brief`\n   `POST {n8n}/webhook/aura-social-campaign`\n   Body JSON:\n   ```json\n   {\n     \"brief\": \"ide / topik campaign (wajib)\",\n     \"campaignName\": \"opsional\",\n     \"platform\": \"Instagram | TikTok | LinkedIn ...\",\n     \"aspectRatio\": \"auto | 9:16 | 16:9\",   // dari BUTTON di website; kosong/auto = default 9:16\n     \"imageUrl\": \"https://... (opsional, kalau prompt + gambar)\",\n     \"callbackUrl\": \"/api/social-campaigns/result (opsional override)\",\n     \"requestId\": \"opsional\"\n   }\n   ```\n2. **Testing lokal / prototype** -> node `Form Trigger - Local Test`\n   Buka `Test URL` dari node itu di browser (jalan di localhost, tanpa deploy).\n\n### Yang harus diisi\n- Kredensial **Google Gemini(PaLM) Api** di 3 node Gemini (pakai API key).\n- Env var n8n: `AURA_BACKEND_URL` (mis. `http://localhost:8000`) dan `AURA_AUTOMATION_KEY`.\n- Ganti `models/gemini-2.5-flash` / `models/gemini-2.5-flash-image-preview` bila perlu.\n- **Telegram (fase testing):** kredensial `Telegram API` (bot token dari @BotFather) di 2 node Telegram + env `AURA_TELEGRAM_CHAT_ID` (chat/grup id, tanya @get_id_bot).\n\n### Alur\nTrigger -> Normalize Input -> (cek gambar) -> Gemini format caption/JSON -> Gemini generate visual (rasio terpilih) -> kirim ke Backend -> kirim hasil ke Telegram (foto + caption + detail) -> balas ke website / tampilkan hasil test."
+      }
+    },
+    {
+      "id": "webhook_website",
+      "name": "Webhook - Website Campaign Brief",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 0],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aura-social-campaign",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "form_local",
+      "name": "Form Trigger - Local Test",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [0, 240],
+      "parameters": {
+        "formTitle": "Aura Social Campaign - Input Brief (Local Test)",
+        "formDescription": "Masukkan ide / topik campaign. Gambar referensi opsional (prompt saja juga boleh).",
+        "responseMode": "lastNode",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Campaign Brief / Topik",
+              "fieldType": "textarea",
+              "placeholder": "Contoh: Campaign peluncuran Aura Smart City Kit untuk siswa SMA, tone edukatif & futuristik, ajak daftar workshop.",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Nama Campaign",
+              "fieldType": "text",
+              "placeholder": "Opsional",
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Platform",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "Instagram" },
+                  { "option": "TikTok" },
+                  { "option": "LinkedIn" },
+                  { "option": "Facebook" },
+                  { "option": "YouTube" }
+                ]
+              },
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Aspect Ratio",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  { "option": "Auto (default 9:16)" },
+                  { "option": "9:16 (Vertical / Story - Reels)" },
+                  { "option": "16:9 (Horizontal / Landscape)" }
+                ]
+              },
+              "requiredField": false
+            },
+            {
+              "fieldLabel": "Reference Image",
+              "fieldType": "file",
+              "requiredField": false,
+              "multipleFiles": false,
+              "acceptFileTypes": ".jpg,.jpeg,.png,.webp"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "normalize_input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 120],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Menyatukan input dari Webhook website ATAU dari Form Trigger lokal.\nconst j = $input.item.json || {};\nconst bin = $input.item.binary || {};\n\nconst isWebhook = j.body !== undefined || j.headers !== undefined;\nconst src = isWebhook ? (j.body || {}) : j;\n\nconst pick = (...keys) => {\n  for (const k of keys) {\n    if (src[k] !== undefined && src[k] !== null && String(src[k]).trim() !== '') return src[k];\n  }\n  return '';\n};\n\nconst brief = String(pick('brief', 'campaignBrief', 'topic', 'idea', 'prompt', 'Campaign Brief / Topik')).trim();\nconst campaignName = String(pick('campaignName', 'campaign', 'Nama Campaign')).trim();\nconst platform = String(pick('platform', 'Platform') || 'Instagram').trim();\nconst callbackUrl = String(pick('callbackUrl', 'callback_url')).trim();\nconst requestId = String(pick('requestId', 'request_id') || $execution.id);\n\nif (!brief || brief.length < 3) {\n  throw new Error('Brief/topik campaign kosong. Kirim field \"brief\" (webhook) atau isi \"Campaign Brief / Topik\" (form).');\n}\n\n// --- Tentukan aspect ratio -------------------------------------------------\n// Prioritas: pilihan tombol user > hint dari teks brief > DEFAULT 9:16\nlet choice = String(pick('aspectRatio', 'ratio', 'resolution', 'Aspect Ratio') || 'auto').toLowerCase();\n\nfunction ratioFromText(t) {\n  const s = String(t || '').toLowerCase();\n  if (/(16\\s*[:x\\/]\\s*9|landscape|horizontal|widescreen|thumbnail|banner)/.test(s)) return '16:9';\n  if (/(9\\s*[:x\\/]\\s*16|vertical|portrait|story|stories|reel|reels|tiktok|shorts)/.test(s)) return '9:16';\n  return null;\n}\n\nlet aspectRatio;\nif (/16\\s*[:x]\\s*9|landscape|horizontal/.test(choice)) {\n  aspectRatio = '16:9';\n} else if (/9\\s*[:x]\\s*16|vertical|portrait/.test(choice)) {\n  aspectRatio = '9:16';\n} else {\n  aspectRatio = ratioFromText(brief) || '9:16';\n}\n\nconst dimensions = aspectRatio === '16:9'\n  ? { width: 1920, height: 1080, label: 'Landscape / Horizontal' }\n  : { width: 1080, height: 1920, label: 'Vertical / Story-Reels' };\n\n// --- Gambar referensi (opsional) -----------------------------------------\nconst imageUrl = String(pick('imageUrl', 'image_url', 'referenceImageUrl')).trim();\nconst imageBase64 = String(pick('imageBase64', 'image_base64')).trim();\nconst binKeys = Object.keys(bin);\nconst hasBinaryImage = binKeys.length > 0;\nconst hasImage = Boolean(imageUrl || imageBase64 || hasBinaryImage);\n\nreturn {\n  json: {\n    source: isWebhook ? 'website_webhook' : 'local_form',\n    requestId,\n    receivedAt: new Date().toISOString(),\n    campaignName,\n    platform,\n    brief,\n    aspectRatio,\n    dimensions,\n    aspectRatioResolvedFrom: /16\\s*[:x]\\s*9|9\\s*[:x]\\s*16|vertical|portrait|landscape|horizontal/.test(choice) ? 'user_button' : (ratioFromText(brief) ? 'brief_text' : 'default'),\n    hasImage,\n    imageUrl,\n    imageBase64,\n    imageBinaryKey: hasBinaryImage ? binKeys[0] : '',\n    callbackUrl\n  },\n  binary: $input.item.binary\n};\n"
+      }
+    },
+    {
+      "id": "if_has_image",
+      "name": "If - Ada Gambar Referensi?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [480, 120],
+      "parameters": {
+        "options": {},
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond_has_image",
+              "leftValue": "={{ $json.hasImage }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "gemini_analyze_image",
+      "name": "Gemini - Analyze Reference Image",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [720, 0],
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": { "__rl": true, "mode": "id", "value": "models/gemini-2.5-flash" },
+        "text": "Deskripsikan gambar referensi ini untuk desainer konten sosial media: warna dominan, gaya visual, mood, objek utama, dan bagaimana elemen ini bisa dipakai untuk visual campaign. Jawab ringkas dalam 4-6 kalimat, Bahasa Indonesia.",
+        "inputType": "url",
+        "imageUrls": "={{ $json.imageUrl }}",
+        "simplify": true,
+        "options": {}
+      },
+      "notes": "Jika gambar dikirim sebagai file upload dari Form (bukan URL), ubah 'Input Type' -> 'Binary' dan 'Input Data Field Name(s)' -> {{ $json.imageBinaryKey }}."
+    },
+    {
+      "id": "merge_image_insight",
+      "name": "Attach Image Insight",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 0],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const norm = $('Normalize Input').item.json;\nconst g = $input.item.json || {};\nconst insight = g.content || g.text || g.response ||\n  (Array.isArray(g.candidates) && g.candidates[0] && g.candidates[0].content && g.candidates[0].content.parts && g.candidates[0].content.parts[0] && g.candidates[0].content.parts[0].text) ||\n  '';\nreturn { json: { ...norm, imageInsight: String(insight).trim() }, binary: $('Normalize Input').item.binary };\n"
+      }
+    },
+    {
+      "id": "no_image_insight",
+      "name": "No Image Insight",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 240],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "return { json: { ...$json, imageInsight: '' }, binary: $input.item.binary };\n"
+      }
+    },
+    {
+      "id": "gemini_generate_post",
+      "name": "Gemini - Format Campaign Post",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [1200, 120],
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": { "__rl": true, "mode": "id", "value": "models/gemini-2.5-flash" },
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "=Buatkan konten campaign media sosial dari brief berikut.\n\nBRIEF / TOPIK:\n{{ $json.brief }}\n\nCAMPAIGN: {{ $json.campaignName || '(tidak disebutkan)' }}\nPLATFORM TARGET: {{ $json.platform }}\nASPECT RATIO OUTPUT: {{ $json.aspectRatio }} ({{ $json.dimensions.label }}, {{ $json.dimensions.width }}x{{ $json.dimensions.height }} px)\nINSIGHT GAMBAR REFERENSI: {{ $json.imageInsight || '(tidak ada gambar referensi)' }}\n\nKembalikan HANYA JSON valid (tanpa markdown fence) dengan struktur:\n{\n  \"headline\": \"judul pendek untuk visual\",\n  \"caption\": \"caption siap posting, hook di kalimat pertama, gaya sesuai platform\",\n  \"hashtags\": [\"#...\", \"#...\"],\n  \"call_to_action\": \"...\",\n  \"image_prompt\": \"prompt detail untuk generate visual utama; WAJIB sebutkan komposisi untuk rasio {{ $json.aspectRatio }}\",\n  \"carousel_slides\": [{ \"slide\": 1, \"title\": \"...\", \"body\": \"...\" }],\n  \"aspect_ratio\": \"{{ $json.aspectRatio }}\",\n  \"dimensions\": \"{{ $json.dimensions.width }}x{{ $json.dimensions.height }}\",\n  \"platform_notes\": \"catatan spesifik platform (durasi, format, best practice)\"\n}"
+            }
+          ]
+        },
+        "simplify": true,
+        "jsonOutput": true,
+        "options": {
+          "systemMessage": "Kamu adalah social media strategist & creative director berpengalaman untuk brand teknologi & edukasi (Aura Analytics / Aura Education). Selalu keluarkan JSON valid tanpa penjelasan tambahan dan tanpa markdown fence. Bahasa Indonesia yang persuasif, ringkas, dan mengikuti tren platform.",
+          "temperature": 0.8
+        }
+      }
+    },
+    {
+      "id": "parse_campaign_json",
+      "name": "Parse Campaign JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 120],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const norm = $('Normalize Input').item.json;\nlet out = $input.item.json || {};\nlet post = (out.content !== undefined) ? out.content : out;\n\nif (typeof post === 'string') {\n  const cleaned = post.replace(/```json/gi, '').replace(/```/g, '').trim();\n  try { post = JSON.parse(cleaned); }\n  catch (e) { post = { headline: '', caption: cleaned, hashtags: [], call_to_action: '', image_prompt: norm.brief, carousel_slides: [], aspect_ratio: norm.aspectRatio, dimensions: norm.dimensions.width + 'x' + norm.dimensions.height, platform_notes: '' }; }\n}\n\n// jaga konsistensi rasio\npost.aspect_ratio = norm.aspectRatio;\npost.dimensions = norm.dimensions.width + 'x' + norm.dimensions.height;\nif (!post.image_prompt) post.image_prompt = norm.brief;\n\nreturn { json: { ...norm, post }, binary: $('Normalize Input').item.binary };\n"
+      }
+    },
+    {
+      "id": "gemini_generate_image",
+      "name": "Gemini - Generate Post Visual",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [1680, 120],
+      "parameters": {
+        "resource": "image",
+        "operation": "generate",
+        "modelId": { "__rl": true, "mode": "id", "value": "models/gemini-2.5-flash-image-preview" },
+        "prompt": "={{ $json.post.image_prompt }}\n\nFormat wajib: rasio {{ $json.aspectRatio }} ({{ $json.dimensions.width }}x{{ $json.dimensions.height }} px), komposisi {{ $json.dimensions.label }}. Sisakan ruang untuk headline: \"{{ $json.post.headline }}\". Kualitas tinggi, gaya modern, siap untuk campaign {{ $json.platform }}.",
+        "options": { "binaryPropertyOutput": "campaign_image" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Visual dihasilkan sesuai rasio terpilih (default 9:16). Kalau tidak butuh generate gambar, disable node ini; payload ke Backend tetap terkirim tanpa field image."
+    },
+    {
+      "id": "build_payload",
+      "name": "Build Backend Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 120],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const base = $('Parse Campaign JSON').item.json;\nconst bin = $input.item.binary || {};\nconst img = bin.campaign_image;\n\nreturn {\n  json: {\n    requestId: base.requestId,\n    source: base.source,\n    status: 'generated',\n    generatedAt: new Date().toISOString(),\n    campaignName: base.campaignName,\n    platform: base.platform,\n    brief: base.brief,\n    aspectRatio: base.aspectRatio,\n    dimensions: base.dimensions,\n    aspectRatioResolvedFrom: base.aspectRatioResolvedFrom,\n    post: base.post,\n    image: img ? {\n      fileName: img.fileName || ('campaign_' + base.requestId + '.png'),\n      mimeType: img.mimeType || 'image/png',\n      dataBase64: img.data || null\n    } : null,\n    callbackUrl: base.callbackUrl || ''\n  },\n  binary: bin\n};\n"
+      }
+    },
+    {
+      "id": "http_backend",
+      "name": "HTTP Request - Send to Aura Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [2160, 120],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.AURA_BACKEND_URL || 'http://localhost:8000') + ($json.callbackUrl || '/api/social-campaigns/result') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "X-Aura-Automation-Key", "value": "={{ $env.AURA_AUTOMATION_KEY || '' }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": { "response": { "response": { "neverError": true } } }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true,
+      "notes": "Endpoint Backend tim. Set env AURA_BACKEND_URL & AURA_AUTOMATION_KEY. Untuk prototype, 'neverError' + continueOnError supaya workflow tetap selesai walau Backend belum siap."
+    },
+    {
+      "id": "if_from_website",
+      "name": "If - Dari Website?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [3340, 120],
+      "parameters": {
+        "options": {},
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond_source",
+              "leftValue": "={{ $('Normalize Input').item.json.source }}",
+              "rightValue": "website_webhook",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "respond_website",
+      "name": "Respond to Website",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3580, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, requestId: $('Build Backend Payload').item.json.requestId, aspectRatio: $('Build Backend Payload').item.json.aspectRatio, post: $('Build Backend Payload').item.json.post, hasImage: !!$('Build Backend Payload').item.json.image, backendResponse: $json }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "local_test_output",
+      "name": "Local Test Result",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3580, 240],
+      "parameters": {}
+    },
+    {
+      "id": "sticky_telegram",
+      "name": "Telegram - fase Testing/Prototype",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2380, -140],
+      "parameters": {
+        "width": 720,
+        "height": 240,
+        "content": "### Kirim hasil ke Telegram (fase Testing/Prototype)\nHasil format campaign (caption, hashtag, carousel, image prompt) + visual yang di-generate dikirim ke Telegram chat.\n\n- Isi kredensial **Telegram API** (bot token @BotFather) di node `Telegram - Kirim Visual` & `Telegram - Kirim Detail`.\n- Set env n8n `AURA_TELEGRAM_CHAT_ID` (id chat / grup; cek via @get_id_bot).\n- Kalau visual tidak ada (node generate gambar di-disable / gagal), otomatis hanya kirim teks.\n- Kalau nanti sudah lewat fase prototype, cukup disable 3 node Telegram ini."
+      }
+    },
+    {
+      "id": "build_telegram_text",
+      "name": "Build Telegram Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2400, 120],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const p = $('Build Backend Payload').item.json;\nconst post = p.post || {};\nconst esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nconst tags = Array.isArray(post.hashtags) ? post.hashtags.join(' ') : (post.hashtags || '');\nconst slides = Array.isArray(post.carousel_slides)\n  ? post.carousel_slides.map((s) => `  ${s.slide || '-'}. <b>${esc(s.title)}</b> \\u2014 ${esc(s.body)}`).join('\\n')\n  : '';\n\nconst dim = (p.dimensions && p.dimensions.width) ? `${p.dimensions.width}x${p.dimensions.height}` : esc(p.dimensions);\n\nconst summary =\n  `\\uD83D\\uDE80 <b>${esc(post.headline || p.campaignName || 'Campaign')}</b>\\n` +\n  `\\uD83D\\uDCF1 ${esc(p.platform)}  |  \\uD83D\\uDDBC\\uFE0F ${esc(p.aspectRatio)} (${dim})  |  \\uD83E\\uDDED ${esc(p.aspectRatioResolvedFrom)}\\n` +\n  `\\uD83C\\uDD94 <code>${esc(p.requestId)}</code> \\u00B7 ${esc(p.source)}`;\n\nlet full =\n  summary + `\\n\\n` +\n  `\\uD83D\\uDCDD <b>Caption</b>\\n${esc(post.caption)}\\n\\n` +\n  (post.call_to_action ? `\\uD83D\\uDC49 <b>CTA:</b> ${esc(post.call_to_action)}\\n\\n` : '') +\n  (tags ? `${esc(tags)}\\n\\n` : '') +\n  (slides ? `\\uD83C\\uDF9E\\uFE0F <b>Carousel</b>\\n${slides}\\n\\n` : '') +\n  (post.platform_notes ? `\\u2139\\uFE0F <b>Notes:</b> ${esc(post.platform_notes)}\\n\\n` : '') +\n  `\\uD83C\\uDFA8 <b>Image prompt</b>\\n${esc(post.image_prompt)}`;\n\nif (full.length > 4000) full = full.slice(0, 3990) + '\\u2026';\nlet caption = summary;\nif (caption.length > 1000) caption = caption.slice(0, 1000);\n\nconst hasVisual = !!(($input.item.binary || {}).campaign_image);\n\nreturn { json: { ...p, tgCaption: caption, tgFull: full, hasVisual }, binary: $input.item.binary };\n"
+      }
+    },
+    {
+      "id": "if_has_visual",
+      "name": "If - Ada Visual?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2620, 120],
+      "parameters": {
+        "options": {},
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond_has_visual",
+              "leftValue": "={{ $json.hasVisual }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "tg_send_photo",
+      "name": "Telegram - Kirim Visual",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2860, 0],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendPhoto",
+        "chatId": "={{ $env.AURA_TELEGRAM_CHAT_ID }}",
+        "binaryData": true,
+        "binaryPropertyName": "campaign_image",
+        "additionalFields": {
+          "caption": "={{ $json.tgCaption }}",
+          "parse_mode": "HTML"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Kirim visual campaign yang di-generate Gemini + caption ringkas ke Telegram."
+    },
+    {
+      "id": "tg_send_text",
+      "name": "Telegram - Kirim Detail",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [3120, 120],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.AURA_TELEGRAM_CHAT_ID }}",
+        "text": "={{ $('Build Telegram Message').item.json.tgFull }}",
+        "additionalFields": { "parse_mode": "HTML" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Kirim detail lengkap (caption, hashtag, carousel, notes, image prompt) sebagai pesan teks."
+    }
+  ],
+  "connections": {
+    "Webhook - Website Campaign Brief": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Form Trigger - Local Test": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Normalize Input": {
+      "main": [[{ "node": "If - Ada Gambar Referensi?", "type": "main", "index": 0 }]]
+    },
+    "If - Ada Gambar Referensi?": {
+      "main": [
+        [{ "node": "Gemini - Analyze Reference Image", "type": "main", "index": 0 }],
+        [{ "node": "No Image Insight", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gemini - Analyze Reference Image": {
+      "main": [[{ "node": "Attach Image Insight", "type": "main", "index": 0 }]]
+    },
+    "Attach Image Insight": {
+      "main": [[{ "node": "Gemini - Format Campaign Post", "type": "main", "index": 0 }]]
+    },
+    "No Image Insight": {
+      "main": [[{ "node": "Gemini - Format Campaign Post", "type": "main", "index": 0 }]]
+    },
+    "Gemini - Format Campaign Post": {
+      "main": [[{ "node": "Parse Campaign JSON", "type": "main", "index": 0 }]]
+    },
+    "Parse Campaign JSON": {
+      "main": [[{ "node": "Gemini - Generate Post Visual", "type": "main", "index": 0 }]]
+    },
+    "Gemini - Generate Post Visual": {
+      "main": [[{ "node": "Build Backend Payload", "type": "main", "index": 0 }]]
+    },
+    "Build Backend Payload": {
+      "main": [[{ "node": "HTTP Request - Send to Aura Backend", "type": "main", "index": 0 }]]
+    },
+    "HTTP Request - Send to Aura Backend": {
+      "main": [[{ "node": "Build Telegram Message", "type": "main", "index": 0 }]]
+    },
+    "Build Telegram Message": {
+      "main": [[{ "node": "If - Ada Visual?", "type": "main", "index": 0 }]]
+    },
+    "If - Ada Visual?": {
+      "main": [
+        [{ "node": "Telegram - Kirim Visual", "type": "main", "index": 0 }],
+        [{ "node": "Telegram - Kirim Detail", "type": "main", "index": 0 }]
+      ]
+    },
+    "Telegram - Kirim Visual": {
+      "main": [[{ "node": "Telegram - Kirim Detail", "type": "main", "index": 0 }]]
+    },
+    "Telegram - Kirim Detail": {
+      "main": [[{ "node": "If - Dari Website?", "type": "main", "index": 0 }]]
+    },
+    "If - Dari Website?": {
+      "main": [
+        [{ "node": "Respond to Website", "type": "main", "index": 0 }],
+        [{ "node": "Local Test Result", "type": "main", "index": 0 }]
+      ]
+    }
+  }
+}
